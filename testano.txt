@@ -1227,6 +1227,288 @@ local function trackPlanWindow(frame, plan)
         and plan.delay > 0 and frame.readClock + plan.delay or nil
 end
 
+-- FOLYAH: how far the dive envelope can still reach, in studs.
+local function keeperReach(f)
+    local dive = M.Dive and M.Dive.Constants
+    local assist = M.Assist and M.Assist.Constants
+    local box = M.Hitboxes and M.Hitboxes.AirReceive
+
+    if not dive or not box or not finiteVector(box.Size) then
+        return nil
+    end
+
+    local extra = assist and assist.MaximumExtraReachStuds or 0
+    local padding = M.Contacts.Constants.ContactPadding or 1.25
+    padding = math.max(1.25, padding, (f.radius or 1) * 2)
+
+    local size = box.Size + Vector3.new(padding, padding, padding)
+    local reach = dive.Distance + extra + size.Magnitude * 0.5 + 0.75
+
+    if not finite(reach) or reach <= 0 then return nil end
+    return reach
+end
+
+-- FOLYAH: a synthetic crossing time for balls that never touch the goal plane.
+-- The planner is hard-wired to f.eta, so instead of a second decision path we
+-- hand it the moment the ball enters the keeper's reach envelope. Every later
+-- stage (hitbox contact, assist solve, direction search, revalidation) then
+-- runs exactly as it does for a real shot.
+--
+-- rawState/world follow sampleFlight's calling convention on purpose: the
+-- physics module wants the authoritative snapshot, not a re-advanced one.
+local function offTargetCrossing(f, rawState, world, timestamp)
+    if not f.context or not f.context.goal then return nil, nil end
+
+    local reach = keeperReach(f)
+    if not reach then return nil, nil end
+
+    reach = reach * (Config.OffTargetReachScale or 1)
+
+    local goal = f.context.goal
+    local mouth = goalHalfWidth(f.context)
+    local gate = reach * (Config.OffTargetGoalScale or 1.4) + mouth * 2
+
+    local horizon = math.min(
+        Config.PredictionHorizon,
+        Config.UrgentShotSeconds
+    )
+
+    if not finite(horizon) or horizon <= 0.01 then return nil, nil end
+    if not finiteVector(rawState.Position) then return nil, nil end
+
+    local step = math.clamp(Config.SampleStep, 0.0025, 0.025)
+    local minimum = Config.TrickShotGuard
+        and (Config.TrickShotMinimumSpeed or 0)
+        or 0
+
+    local a, b = {}, {}
+    local state = rawState
+    local t = 0
+
+    while t < horizon - 0.000001 do
+        t = math.min(horizon, t + step)
+
+        local output = state == a and b or a
+        state = M.Physics.GetStateAtTime(state, timestamp + t, world, output)
+
+        if type(state) ~= "table" then return nil, nil end
+        if not finiteVector(state.Position) then return nil, nil end
+        if not finiteVector(state.Velocity) then return nil, nil end
+
+        local p = state.Position
+        local reach3 = flat(p - f.rootCF.Position)
+
+        if reach3.Magnitude <= reach then
+            if flat(goal.Position - p).Magnitude <= gate then
+                if state.Velocity.Magnitude >= minimum then
+                    return p, t
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+-- FOLYAH: wrapper used by snapshot. Any internal slip degrades to the
+-- original "no goal-bound shot" behaviour instead of unwinding tick().
+local function tryOffTarget(f, rawState, world, timestamp)
+    if not Config.ReactToOffTarget then return nil, nil end
+
+    local ok, hit, when = pcall(
+        offTargetCrossing,
+        f,
+        rawState,
+        world,
+        timestamp
+    )
+
+    if not ok then
+        Folyah.LastError = "off-target: " .. tostring(hit)
+        report("OFF TARGET", hit)
+        return nil, nil
+    end
+
+    if hit and finite(when) and when > 0 then
+        Folyah.OffTarget = Folyah.OffTarget + 1
+        Folyah.LastEvent = "off-target"
+
+        if Config.TrickShotGuard then
+            Folyah.TrickShot = Folyah.TrickShot + 1
+        end
+
+        return hit, when
+    end
+
+    return nil, nil
+end
+
+-- FOLYAH: closest opposing outfielder still inside the dive envelope.
+local function tackleCandidate(f)
+    if not Config.AutoTackle then return nil end
+    if S.controller or S.motionLease or S.jump then return nil end
+    if os.clock() < S.nextTackleAt then return nil end
+    if os.clock() < S.nextActionAt then return nil end
+
+    local root = f and f.root
+    if not root or not f.context then return nil end
+
+    local mine = f.context.team
+    if not mine then return nil end
+
+    local best, bestDistance = nil, Config.TackleRange
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local name = M.Teams.GetActorTeamName(player)
+
+            if name and name ~= mine then
+                local character = player.Character
+                local humanoid = character
+                    and character:FindFirstChildOfClass("Humanoid")
+
+                if humanoid and humanoid.Health > 0 then
+                    local other = character:FindFirstChild(
+                        "HumanoidRootPart"
+                    )
+
+                    if other then
+                        local distance = flat(
+                            other.Position - root.Position
+                        ).Magnitude
+
+                        if distance < bestDistance then
+                            best, bestDistance = other, distance
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return best, bestDistance
+end
+
+-- FOLYAH: tackles aim at a body, so the ball-contact proof requestDive
+-- performs cannot apply. Everything else - authorization, locks, lease
+-- bookkeeping, repeat delay - is shared so the two paths never interleave.
+local function requestTackleDive(f)
+    if not authorizedFrame(f) then return false end
+    if blocked(f.character, f.root) then return false end
+    if S.motionLease or S.controller or S.jump then return false end
+
+    local target, distance = tackleCandidate(f)
+    if not target or not distance then return false end
+
+    local offset = flat(target.Position - f.rootCF.Position)
+    if offset.Magnitude < 0.05 then return false end
+
+    local basis = CFrame.lookAt(
+        f.rootCF.Position,
+        f.rootCF.Position + f.context.forward
+    )
+
+    local ok, choice = pcall(
+        M.Dive.GetDirectionChoice,
+        offset.Unit,
+        basis,
+        Vector3.yAxis
+    )
+
+    if not ok or type(choice) ~= "table" then
+        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
+        return false
+    end
+
+    S.nextLeaseId = S.nextLeaseId + 1
+
+    local lease = {
+        id = S.nextLeaseId,
+        character = f.character,
+        root = f.root,
+        lockName = S.moveLock .. "." .. tostring(S.nextLeaseId),
+        lockHeld = false,
+        controller = nil,
+        closed = false,
+        deadline = os.clock()
+            + M.Dive.Constants.DurationSeconds + 2,
+    }
+
+    S.motionLease = lease
+    S.nextActionAt = os.clock() + M.Dive.Constants.RepeatDelaySeconds
+    S.nextTackleAt = os.clock() + Config.TackleCooldown
+
+    local started, err = pcall(function()
+        lease.lockHeld = true
+
+        M.Movement.LockMovement(lease.lockName)
+        S.ownLockAcquires = S.ownLockAcquires + 1
+
+        local controller = M.Dive.Run(
+            f.root,
+            f.humanoid,
+            choice,
+
+            function()
+                return basis
+            end,
+
+            {
+                StartedAt = now(),
+
+                Finish = function(_, finished)
+                    if S.motionLease == lease and (
+                        not lease.controller
+                        or lease.controller == finished
+                    ) then
+                        finishMotion(false, lease)
+                    end
+                end,
+            }
+        )
+
+        assert(controller, "Tackle dive controller refused to start")
+        lease.controller = controller
+    end)
+
+    if not started then
+        finishMotion(true, lease)
+        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
+        Folyah.LastError = "tackle: " .. tostring(err)
+        report("TACKLE DIVE", err)
+        return false
+    end
+
+    S.coverageFrame = nil
+
+    Folyah.Tackle = Folyah.Tackle + 1
+    Folyah.LastEvent = "tackle"
+
+    status(
+        "TACKLE DIVE",
+        string.format("Target %.1f studs", distance)
+    )
+
+    return true
+end
+
+-- FOLYAH: wrapper so a tackle slip can never unwind the heartbeat. A verified
+-- goal-bound shot always outranks a tackle.
+local function tryAutoTackle(f)
+    if not f or not Config.AutoTackle then return false end
+
+    local ok, dove = pcall(requestTackleDive, f)
+
+    if not ok then
+        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
+        Folyah.LastError = "tackle: " .. tostring(dove)
+        report("AUTO TACKLE", dove)
+        return false
+    end
+
+    return dove == true
+end
+
 local function snapshot(character, root, humanoid)
     local readClock = os.clock()
     local ball = readBall()
@@ -2042,288 +2324,6 @@ local function divePathMayReach(f, points, horizon)
         or minX > math.max(start.X, finish.X) + reach
         or maxZ < math.min(start.Z, finish.Z) - reach
         or minZ > math.max(start.Z, finish.Z) + reach)
-end
-
--- FOLYAH: how far the dive envelope can still reach, in studs.
-local function keeperReach(f)
-    local dive = M.Dive and M.Dive.Constants
-    local assist = M.Assist and M.Assist.Constants
-    local box = M.Hitboxes and M.Hitboxes.AirReceive
-
-    if not dive or not box or not finiteVector(box.Size) then
-        return nil
-    end
-
-    local extra = assist and assist.MaximumExtraReachStuds or 0
-    local padding = M.Contacts.Constants.ContactPadding or 1.25
-    padding = math.max(1.25, padding, (f.radius or 1) * 2)
-
-    local size = box.Size + Vector3.new(padding, padding, padding)
-    local reach = dive.Distance + extra + size.Magnitude * 0.5 + 0.75
-
-    if not finite(reach) or reach <= 0 then return nil end
-    return reach
-end
-
--- FOLYAH: a synthetic crossing time for balls that never touch the goal plane.
--- The planner is hard-wired to f.eta, so instead of a second decision path we
--- hand it the moment the ball enters the keeper's reach envelope. Every later
--- stage (hitbox contact, assist solve, direction search, revalidation) then
--- runs exactly as it does for a real shot.
---
--- rawState/world follow sampleFlight's calling convention on purpose: the
--- physics module wants the authoritative snapshot, not a re-advanced one.
-local function offTargetCrossing(f, rawState, world, timestamp)
-    if not f.context or not f.context.goal then return nil, nil end
-
-    local reach = keeperReach(f)
-    if not reach then return nil, nil end
-
-    reach = reach * (Config.OffTargetReachScale or 1)
-
-    local goal = f.context.goal
-    local mouth = goalHalfWidth(f.context)
-    local gate = reach * (Config.OffTargetGoalScale or 1.4) + mouth * 2
-
-    local horizon = math.min(
-        Config.PredictionHorizon,
-        Config.UrgentShotSeconds
-    )
-
-    if not finite(horizon) or horizon <= 0.01 then return nil, nil end
-    if not finiteVector(rawState.Position) then return nil, nil end
-
-    local step = math.clamp(Config.SampleStep, 0.0025, 0.025)
-    local minimum = Config.TrickShotGuard
-        and (Config.TrickShotMinimumSpeed or 0)
-        or 0
-
-    local a, b = {}, {}
-    local state = rawState
-    local t = 0
-
-    while t < horizon - 0.000001 do
-        t = math.min(horizon, t + step)
-
-        local output = state == a and b or a
-        state = M.Physics.GetStateAtTime(state, timestamp + t, world, output)
-
-        if type(state) ~= "table" then return nil, nil end
-        if not finiteVector(state.Position) then return nil, nil end
-        if not finiteVector(state.Velocity) then return nil, nil end
-
-        local p = state.Position
-        local reach3 = flat(p - f.rootCF.Position)
-
-        if reach3.Magnitude <= reach then
-            if flat(goal.Position - p).Magnitude <= gate then
-                if state.Velocity.Magnitude >= minimum then
-                    return p, t
-                end
-            end
-        end
-    end
-
-    return nil, nil
-end
-
--- FOLYAH: wrapper used by snapshot. Any internal slip degrades to the
--- original "no goal-bound shot" behaviour instead of unwinding tick().
-local function tryOffTarget(f, rawState, world, timestamp)
-    if not Config.ReactToOffTarget then return nil, nil end
-
-    local ok, hit, when = pcall(
-        offTargetCrossing,
-        f,
-        rawState,
-        world,
-        timestamp
-    )
-
-    if not ok then
-        Folyah.LastError = "off-target: " .. tostring(hit)
-        report("OFF TARGET", hit)
-        return nil, nil
-    end
-
-    if hit and finite(when) and when > 0 then
-        Folyah.OffTarget = Folyah.OffTarget + 1
-        Folyah.LastEvent = "off-target"
-
-        if Config.TrickShotGuard then
-            Folyah.TrickShot = Folyah.TrickShot + 1
-        end
-
-        return hit, when
-    end
-
-    return nil, nil
-end
-
--- FOLYAH: closest opposing outfielder still inside the dive envelope.
-local function tackleCandidate(f)
-    if not Config.AutoTackle then return nil end
-    if S.controller or S.motionLease or S.jump then return nil end
-    if os.clock() < S.nextTackleAt then return nil end
-    if os.clock() < S.nextActionAt then return nil end
-
-    local root = f and f.root
-    if not root or not f.context then return nil end
-
-    local mine = f.context.team
-    if not mine then return nil end
-
-    local best, bestDistance = nil, Config.TackleRange
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local name = M.Teams.GetActorTeamName(player)
-
-            if name and name ~= mine then
-                local character = player.Character
-                local humanoid = character
-                    and character:FindFirstChildOfClass("Humanoid")
-
-                if humanoid and humanoid.Health > 0 then
-                    local other = character:FindFirstChild(
-                        "HumanoidRootPart"
-                    )
-
-                    if other then
-                        local distance = flat(
-                            other.Position - root.Position
-                        ).Magnitude
-
-                        if distance < bestDistance then
-                            best, bestDistance = other, distance
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return best, bestDistance
-end
-
--- FOLYAH: tackles aim at a body, so the ball-contact proof requestDive
--- performs cannot apply. Everything else - authorization, locks, lease
--- bookkeeping, repeat delay - is shared so the two paths never interleave.
-local function requestTackleDive(f)
-    if not authorizedFrame(f) then return false end
-    if blocked(f.character, f.root) then return false end
-    if S.motionLease or S.controller or S.jump then return false end
-
-    local target, distance = tackleCandidate(f)
-    if not target or not distance then return false end
-
-    local offset = flat(target.Position - f.rootCF.Position)
-    if offset.Magnitude < 0.05 then return false end
-
-    local basis = CFrame.lookAt(
-        f.rootCF.Position,
-        f.rootCF.Position + f.context.forward
-    )
-
-    local ok, choice = pcall(
-        M.Dive.GetDirectionChoice,
-        offset.Unit,
-        basis,
-        Vector3.yAxis
-    )
-
-    if not ok or type(choice) ~= "table" then
-        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
-        return false
-    end
-
-    S.nextLeaseId = S.nextLeaseId + 1
-
-    local lease = {
-        id = S.nextLeaseId,
-        character = f.character,
-        root = f.root,
-        lockName = S.moveLock .. "." .. tostring(S.nextLeaseId),
-        lockHeld = false,
-        controller = nil,
-        closed = false,
-        deadline = os.clock()
-            + M.Dive.Constants.DurationSeconds + 2,
-    }
-
-    S.motionLease = lease
-    S.nextActionAt = os.clock() + M.Dive.Constants.RepeatDelaySeconds
-    S.nextTackleAt = os.clock() + Config.TackleCooldown
-
-    local started, err = pcall(function()
-        lease.lockHeld = true
-
-        M.Movement.LockMovement(lease.lockName)
-        S.ownLockAcquires = S.ownLockAcquires + 1
-
-        local controller = M.Dive.Run(
-            f.root,
-            f.humanoid,
-            choice,
-
-            function()
-                return basis
-            end,
-
-            {
-                StartedAt = now(),
-
-                Finish = function(_, finished)
-                    if S.motionLease == lease and (
-                        not lease.controller
-                        or lease.controller == finished
-                    ) then
-                        finishMotion(false, lease)
-                    end
-                end,
-            }
-        )
-
-        assert(controller, "Tackle dive controller refused to start")
-        lease.controller = controller
-    end)
-
-    if not started then
-        finishMotion(true, lease)
-        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
-        Folyah.LastError = "tackle: " .. tostring(err)
-        report("TACKLE DIVE", err)
-        return false
-    end
-
-    S.coverageFrame = nil
-
-    Folyah.Tackle = Folyah.Tackle + 1
-    Folyah.LastEvent = "tackle"
-
-    status(
-        "TACKLE DIVE",
-        string.format("Target %.1f studs", distance)
-    )
-
-    return true
-end
-
--- FOLYAH: wrapper so a tackle slip can never unwind the heartbeat. A verified
--- goal-bound shot always outranks a tackle.
-local function tryAutoTackle(f)
-    if not f or not Config.AutoTackle then return false end
-
-    local ok, dove = pcall(requestTackleDive, f)
-
-    if not ok then
-        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
-        Folyah.LastError = "tackle: " .. tostring(dove)
-        report("AUTO TACKLE", dove)
-        return false
-    end
-
-    return dove == true
 end
 
 local function planSave(f)
