@@ -256,13 +256,12 @@ local Config = {
     -- FOLYAH: off-target reaction, trick-shot guard and auto tackle.
     ReactToOffTarget = true,
     OffTargetReachScale = 1,
-    OffTargetGoalScale = 1.35,
+    OffTargetGoalScale = 1.4,
     TrickShotGuard = true,
-    TrickShotMinimumSpeed = 8,
+    TrickShotMinimumSpeed = 6,
     AutoTackle = true,
     TackleRange = 20,
     TackleCooldown = 1.2,
-    TackleMinimumSpeed = 3,
 }
 
 local Stats = {
@@ -371,6 +370,17 @@ local S = {
         .. tostring(math.floor(os.clock() * 1000000)),
     nextTackleAt = 0,
 }
+
+-- FOLYAH: observable counters so each new path can be confirmed firing.
+local Folyah = {
+    OffTarget = 0,
+    TrickShot = 0,
+    Tackle = 0,
+    TackleBlocked = 0,
+    LastEvent = "none",
+    LastError = nil,
+}
+ENV.FolyahStats = Folyah
 
 -- Installed before listeners so partial initialization has the same cleanup contract.
 local function cleanup()
@@ -1289,28 +1299,23 @@ local function snapshot(character, root, humanoid)
         return nil, "INVALID GOAL CROSSING"
     end
 
-    -- FOLYAH: no goal-plane crossing, so fall back to the reach envelope.
-    if position == nil and Config.ReactToOffTarget then
-        local reach = keeperReach(
-            { radius = radius, rootCF = root.CFrame }
+    -- FOLYAH: no goal-plane crossing; fall back to the reach envelope so the
+    -- planner still receives an eta instead of dying on nil arithmetic.
+    if position == nil then
+        local offPosition, offTime = tryOffTarget(
+            {
+                context = context,
+                rootCF = root.CFrame,
+                radius = radius,
+            },
+            state,
+            world,
+            timestamp
         )
 
-        if reach and reach * (Config.OffTargetReachScale or 1) >= reach then
-            local offPosition, offTime = offTargetCrossing(
-                {
-                    context = context,
-                    rootCF = root.CFrame,
-                    radius = radius,
-                },
-                current,
-                world,
-                timestamp
-            )
-
-            if offPosition and finite(offTime) and offTime > 0 then
-                position = offPosition
-                crossingTime = timestamp + offTime
-            end
+        if offPosition then
+            position = offPosition
+            crossingTime = timestamp + offTime
         end
     end
 
@@ -2039,17 +2044,19 @@ local function divePathMayReach(f, points, horizon)
         or minZ > math.max(start.Z, finish.Z) + reach)
 end
 
--- FOLYAH: keeper reach envelope used to decide when a ball that never
--- crosses the goal plane is still physically interceptable.
+-- FOLYAH: how far the dive envelope can still reach, in studs.
 local function keeperReach(f)
     local dive = M.Dive and M.Dive.Constants
     local assist = M.Assist and M.Assist.Constants
     local box = M.Hitboxes and M.Hitboxes.AirReceive
-    if not dive or not box then return nil end
+
+    if not dive or not box or not finiteVector(box.Size) then
+        return nil
+    end
 
     local extra = assist and assist.MaximumExtraReachStuds or 0
     local padding = M.Contacts.Constants.ContactPadding or 1.25
-    padding = math.max(1.25, padding, f.radius * 2)
+    padding = math.max(1.25, padding, (f.radius or 1) * 2)
 
     local size = box.Size + Vector3.new(padding, padding, padding)
     local reach = dive.Distance + extra + size.Magnitude * 0.5 + 0.75
@@ -2058,21 +2065,25 @@ local function keeperReach(f)
     return reach
 end
 
--- FOLYAH: produces a synthetic goal crossing for balls that stay outside the
--- goal frame. The returned time feeds f.eta, so every existing planner stage
--- (hitbox contact, assist solve, direction search, request validation) runs
--- unchanged instead of being reimplemented.
-local function offTargetCrossing(f, current, world, timestamp)
-    if not Config.ReactToOffTarget then return nil, nil end
+-- FOLYAH: a synthetic crossing time for balls that never touch the goal plane.
+-- The planner is hard-wired to f.eta, so instead of a second decision path we
+-- hand it the moment the ball enters the keeper's reach envelope. Every later
+-- stage (hitbox contact, assist solve, direction search, revalidation) then
+-- runs exactly as it does for a real shot.
+--
+-- rawState/world follow sampleFlight's calling convention on purpose: the
+-- physics module wants the authoritative snapshot, not a re-advanced one.
+local function offTargetCrossing(f, rawState, world, timestamp)
     if not f.context or not f.context.goal then return nil, nil end
 
     local reach = keeperReach(f)
     if not reach then return nil, nil end
 
     reach = reach * (Config.OffTargetReachScale or 1)
+
     local goal = f.context.goal
     local mouth = goalHalfWidth(f.context)
-    local gate = reach * (Config.OffTargetGoalScale or 1.35) + mouth * 2
+    local gate = reach * (Config.OffTargetGoalScale or 1.4) + mouth * 2
 
     local horizon = math.min(
         Config.PredictionHorizon,
@@ -2080,34 +2091,31 @@ local function offTargetCrossing(f, current, world, timestamp)
     )
 
     if not finite(horizon) or horizon <= 0.01 then return nil, nil end
+    if not finiteVector(rawState.Position) then return nil, nil end
 
     local step = math.clamp(Config.SampleStep, 0.0025, 0.025)
-    local state = current
-    local a, b = {}, {}
-    local t = 0
     local minimum = Config.TrickShotGuard
         and (Config.TrickShotMinimumSpeed or 0)
         or 0
+
+    local a, b = {}, {}
+    local state = rawState
+    local t = 0
 
     while t < horizon - 0.000001 do
         t = math.min(horizon, t + step)
 
         local output = state == a and b or a
-        state = M.Physics.GetStateAtTime(
-            state,
-            timestamp + t,
-            world,
-            output
-        )
+        state = M.Physics.GetStateAtTime(state, timestamp + t, world, output)
 
-        if not state or not finiteVector(state.Position) then
-            return nil, nil
-        end
+        if type(state) ~= "table" then return nil, nil end
+        if not finiteVector(state.Position) then return nil, nil end
+        if not finiteVector(state.Velocity) then return nil, nil end
 
         local p = state.Position
-        local offset = flat(p - f.rootCF.Position)
+        local reach3 = flat(p - f.rootCF.Position)
 
-        if offset.Magnitude <= reach then
+        if reach3.Magnitude <= reach then
             if flat(goal.Position - p).Magnitude <= gate then
                 if state.Velocity.Magnitude >= minimum then
                     return p, t
@@ -2119,7 +2127,40 @@ local function offTargetCrossing(f, current, world, timestamp)
     return nil, nil
 end
 
--- FOLYAH: nearest opposing outfielder inside the dive envelope.
+-- FOLYAH: wrapper used by snapshot. Any internal slip degrades to the
+-- original "no goal-bound shot" behaviour instead of unwinding tick().
+local function tryOffTarget(f, rawState, world, timestamp)
+    if not Config.ReactToOffTarget then return nil, nil end
+
+    local ok, hit, when = pcall(
+        offTargetCrossing,
+        f,
+        rawState,
+        world,
+        timestamp
+    )
+
+    if not ok then
+        Folyah.LastError = "off-target: " .. tostring(hit)
+        report("OFF TARGET", hit)
+        return nil, nil
+    end
+
+    if hit and finite(when) and when > 0 then
+        Folyah.OffTarget = Folyah.OffTarget + 1
+        Folyah.LastEvent = "off-target"
+
+        if Config.TrickShotGuard then
+            Folyah.TrickShot = Folyah.TrickShot + 1
+        end
+
+        return hit, when
+    end
+
+    return nil, nil
+end
+
+-- FOLYAH: closest opposing outfielder still inside the dive envelope.
 local function tackleCandidate(f)
     if not Config.AutoTackle then return nil end
     if S.controller or S.motionLease or S.jump then return nil end
@@ -2165,35 +2206,36 @@ local function tackleCandidate(f)
     return best, bestDistance
 end
 
--- FOLYAH: tackles aim the dive at a body, not at the ball, so this path
--- deliberately skips the ball-contact proof requestDive performs. Every
--- other guard (authorization, locks, lease bookkeeping, repeat delay) is
--- shared with the normal dive so the two can never interleave.
+-- FOLYAH: tackles aim at a body, so the ball-contact proof requestDive
+-- performs cannot apply. Everything else - authorization, locks, lease
+-- bookkeeping, repeat delay - is shared so the two paths never interleave.
 local function requestTackleDive(f)
     if not authorizedFrame(f) then return false end
     if blocked(f.character, f.root) then return false end
     if S.motionLease or S.controller or S.jump then return false end
 
     local target, distance = tackleCandidate(f)
-    if not target then return false end
+    if not target or not distance then return false end
 
-    if flat(target.Position - f.rootCF.Position).Magnitude < 0.05 then
-        return false
-    end
+    local offset = flat(target.Position - f.rootCF.Position)
+    if offset.Magnitude < 0.05 then return false end
 
-    local direction = flat(target.Position - f.rootCF.Position).Unit
     local basis = CFrame.lookAt(
         f.rootCF.Position,
         f.rootCF.Position + f.context.forward
     )
 
-    local choice = M.Dive.GetDirectionChoice(
-        direction,
+    local ok, choice = pcall(
+        M.Dive.GetDirectionChoice,
+        offset.Unit,
         basis,
         Vector3.yAxis
     )
 
-    if not choice then return false end
+    if not ok or type(choice) ~= "table" then
+        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
+        return false
+    end
 
     S.nextLeaseId = S.nextLeaseId + 1
 
@@ -2213,7 +2255,7 @@ local function requestTackleDive(f)
     S.nextActionAt = os.clock() + M.Dive.Constants.RepeatDelaySeconds
     S.nextTackleAt = os.clock() + Config.TackleCooldown
 
-    local ok, err = pcall(function()
+    local started, err = pcall(function()
         lease.lockHeld = true
 
         M.Movement.LockMovement(lease.lockName)
@@ -2246,13 +2288,18 @@ local function requestTackleDive(f)
         lease.controller = controller
     end)
 
-    if not ok then
+    if not started then
         finishMotion(true, lease)
+        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
+        Folyah.LastError = "tackle: " .. tostring(err)
         report("TACKLE DIVE", err)
         return false
     end
 
     S.coverageFrame = nil
+
+    Folyah.Tackle = Folyah.Tackle + 1
+    Folyah.LastEvent = "tackle"
 
     status(
         "TACKLE DIVE",
@@ -2262,13 +2309,21 @@ local function requestTackleDive(f)
     return true
 end
 
--- FOLYAH: a verified goal-bound shot always outranks a tackle.
+-- FOLYAH: wrapper so a tackle slip can never unwind the heartbeat. A verified
+-- goal-bound shot always outranks a tackle.
 local function tryAutoTackle(f)
     if not f or not Config.AutoTackle then return false end
-    if S.controller or S.motionLease or S.jump then return false end
-    if f.eta and f.eta <= Config.UrgentShotSeconds then return false end
 
-    return requestTackleDive(f)
+    local ok, dove = pcall(requestTackleDive, f)
+
+    if not ok then
+        Folyah.TackleBlocked = Folyah.TackleBlocked + 1
+        Folyah.LastError = "tackle: " .. tostring(dove)
+        report("AUTO TACKLE", dove)
+        return false
+    end
+
+    return dove == true
 end
 
 local function planSave(f)
@@ -4815,7 +4870,11 @@ local function tick(dt)
 
     S.currentContext = f.context
 
-    if tryAutoTackle(f) then
+    if f.eta and f.eta <= Config.UrgentShotSeconds then
+        if tryAutoTackle(f) then
+            return
+        end
+    elseif tryAutoTackle(f) then
         return
     end
 
@@ -8973,18 +9032,18 @@ do
         "Tackle range",
 
         {
-            { value = 12, label = "12 studs" },
-            { value = 16, label = "16 studs" },
-            { value = 20, label = "20 studs" },
-            { value = 24, label = "24 studs" },
+            { value = "12", label = "12 studs" },
+            { value = "16", label = "16 studs" },
+            { value = "20", label = "20 studs" },
+            { value = "24", label = "24 studs" },
         },
 
         function()
-            return Config.TackleRange
+            return tostring(Config.TackleRange)
         end,
 
         function(value)
-            Config.TackleRange = value
+            Config.TackleRange = tonumber(value) or 20
         end
     )
 
