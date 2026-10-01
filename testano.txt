@@ -132,7 +132,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.9 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.6 + FOLYAH-v2 | STR 0.16 | Misc 0.9 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
