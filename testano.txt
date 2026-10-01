@@ -1268,10 +1268,10 @@ local function offTargetCrossing(f, rawState, world, timestamp)
     local mouth = goalHalfWidth(f.context)
     local gate = reach * (Config.OffTargetGoalScale or 1.4) + mouth * 2
 
-    local horizon = math.min(
-        Config.PredictionHorizon,
-        Config.UrgentShotSeconds
-    )
+    -- Use the full prediction horizon, not the urgent-shot window. The
+    -- injected eta has to be the moment of closest approach, which for a
+    -- loose ball is routinely further out than UrgentShotSeconds.
+    local horizon = Config.PredictionHorizon
 
     if not finite(horizon) or horizon <= 0.01 then return nil, nil end
     if not finiteVector(rawState.Position) then return nil, nil end
@@ -1283,6 +1283,7 @@ local function offTargetCrossing(f, rawState, world, timestamp)
 
     local a, b = {}, {}
     local state = rawState
+    local rejected = false
     local t = 0
 
     while t < horizon - 0.000001 do
@@ -1291,9 +1292,9 @@ local function offTargetCrossing(f, rawState, world, timestamp)
         local output = state == a and b or a
         state = M.Physics.GetStateAtTime(state, timestamp + t, world, output)
 
-        if type(state) ~= "table" then return nil, nil end
-        if not finiteVector(state.Position) then return nil, nil end
-        if not finiteVector(state.Velocity) then return nil, nil end
+        if type(state) ~= "table" then return nil, nil, rejected end
+        if not finiteVector(state.Position) then return nil, nil, rejected end
+        if not finiteVector(state.Velocity) then return nil, nil, rejected end
 
         local p = state.Position
         local reach3 = flat(p - f.rootCF.Position)
@@ -1301,13 +1302,19 @@ local function offTargetCrossing(f, rawState, world, timestamp)
         if reach3.Magnitude <= reach then
             if flat(goal.Position - p).Magnitude <= gate then
                 if state.Velocity.Magnitude >= minimum then
-                    return p, t
+                    return p, t, rejected
                 end
+
+                -- In reach but too slow to be worth a dive: a rolling or
+                -- trick-lofted ball. Report the refusal instead of quietly
+                -- spending the rest of the horizon on it.
+                rejected = true
+                return nil, nil, rejected
             end
         end
     end
 
-    return nil, nil
+    return nil, nil, rejected
 end
 
 -- FOLYAH: wrapper used by snapshot. Any internal slip degrades to the
@@ -1315,7 +1322,7 @@ end
 local function tryOffTarget(f, rawState, world, timestamp)
     if not Config.ReactToOffTarget then return nil, nil end
 
-    local ok, hit, when = pcall(
+    local ok, hit, when, rejected = pcall(
         offTargetCrossing,
         f,
         rawState,
@@ -1333,11 +1340,12 @@ local function tryOffTarget(f, rawState, world, timestamp)
         Folyah.OffTarget = Folyah.OffTarget + 1
         Folyah.LastEvent = "off-target"
 
-        if Config.TrickShotGuard then
-            Folyah.TrickShot = Folyah.TrickShot + 1
-        end
-
         return hit, when
+    end
+
+    if rejected then
+        Folyah.TrickShot = Folyah.TrickShot + 1
+        Folyah.LastEvent = "trick-shot guarded"
     end
 
     return nil, nil
@@ -1393,6 +1401,11 @@ end
 -- performs cannot apply. Everything else - authorization, locks, lease
 -- bookkeeping, repeat delay - is shared so the two paths never interleave.
 local function requestTackleDive(f)
+    -- A verified goal-bound shot outranks a tackle. f.eta is only set by the
+    -- real crossing solver, or by our own off-target fallback; refuse whenever
+    -- the planner already has a shot to save, urgent or not.
+    if f.eta and f.eta > 0 and not f.offTarget then return false end
+
     if not authorizedFrame(f) then return false end
     if blocked(f.character, f.root) then return false end
     if S.motionLease or S.controller or S.jump then return false end
@@ -1509,6 +1522,36 @@ local function tryAutoTackle(f)
     return dove == true
 end
 
+-- FOLYAH: the ball carrier case never produces a snapshot, so tackleCandidate
+-- needs a frame built straight from the character. eta stays nil, which is what
+-- lets a tackle proceed: a carried ball is not a goal-bound shot.
+local function tackleFrame(character, root, humanoid, context)
+    if not character or not root or not humanoid or not context then
+        return nil
+    end
+
+    return {
+        character = character,
+        root = root,
+        humanoid = humanoid,
+        rootCF = root.CFrame,
+        context = context,
+        eta = nil,
+        offTarget = false,
+    }
+end
+
+local function tryTackleWhileOwned(character, root, humanoid, context, owner)
+    if not Config.AutoTackle then return false end
+    if owner == LocalPlayer.UserId then return false end
+
+    local frame = tackleFrame(character, root, humanoid, context)
+    if not frame then return false end
+    if not tackleCandidate(frame) then return false end
+
+    return tryAutoTackle(frame)
+end
+
 local function snapshot(character, root, humanoid)
     local readClock = os.clock()
     local ball = readBall()
@@ -1560,6 +1603,7 @@ local function snapshot(character, root, humanoid)
     end
 
     local position, crossingTime
+    local offTarget = false
 
     if not (
         context.team
@@ -1598,6 +1642,7 @@ local function snapshot(character, root, humanoid)
         if offPosition then
             position = offPosition
             crossingTime = timestamp + offTime
+            offTarget = true
         end
     end
 
@@ -1645,6 +1690,7 @@ local function snapshot(character, root, humanoid)
         flightKey = ball.flightKey,
         goalPosition = position,
         goalTime = crossingTime,
+        offTarget = offTarget,
 
         eta = position
             and finite(crossingTime)
@@ -4772,6 +4818,22 @@ local function tick(dt)
 
             S.missingSince = nil
 
+            -- FOLYAH: the ball is held, so there is no goal-bound eta and no
+            -- snapshot. This is the only place a body tackle makes sense.
+            local tackleOK, tackled = pcall(
+                tryTackleWhileOwned,
+                character,
+                root,
+                humanoid,
+                context,
+                ball.owner
+            )
+
+            if tackleOK and tackled then
+                S.coverageFrame = nil
+                return
+            end
+
             local rushOK, rushed = pcall(
                 tryCloseRush,
                 character,
@@ -4870,11 +4932,9 @@ local function tick(dt)
 
     S.currentContext = f.context
 
-    if f.eta and f.eta <= Config.UrgentShotSeconds then
-        if tryAutoTackle(f) then
-            return
-        end
-    elseif tryAutoTackle(f) then
+    -- requestTackleDive refuses whenever a real goal-bound shot is pending,
+    -- so this only fires on off-target or no-eta frames.
+    if tryAutoTackle(f) then
         return
     end
 
