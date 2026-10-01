@@ -1,0 +1,442 @@
+--[[
+    Auto GK Advanced - Versão Completa
+    Baseado no script original de wek634 (9.194 linhas)
+    Com 3 novas funções:
+    1. React to Off-Target (Reação a bolas fora do gol)
+    2. Detect Trick Shots (Detecção de chutes enganosos)
+    3. Auto Tackle (Tackle automático em adversários)
+    
+    Execução: loadstring(game:HttpGet("SEU_LINK_AQUI"))()
+]]
+
+--==============================================================
+-- STARTUP CONTROLLER
+--==============================================================
+
+local function createDmcStartup(d)
+    local B = {
+        stage = "Waiting for the game", finished = false,
+        cleanup = nil,
+        error = nil,
+    }
+    function B.Status(text)
+        B.stage = text
+        if not B.finished then pcall(d.show, "Auto GK | Starting", text) end
+    end
+    function B.Load(path)
+        B.Status("Loading " .. path)
+        local object = d.resolve(path)
+        local result, closed
+        d.spawn(function()
+            local values = table.pack(pcall(d.require, object))
+            if not closed then result = values end
+        end)
+        local deadline = d.now() + 30
+        while not result and d.now() < deadline do d.wait() end
+        closed = true
+        assert(result, "Timed out loading " .. path)
+        assert(result[1], "Cannot load " .. path .. ": " .. tostring(result[2]))
+        assert(type(result[2]) == "table", "Unexpected module result: " .. path)
+        return result[2]
+    end
+    function B.Run(main)
+        B.Status(B.stage)
+        local ok, err = pcall(function() d.ready(); main(B) end)
+        B.finished = true
+        if ok then
+            pcall(d.hide)
+        else
+            local message = tostring(err)
+            local cleanup = B.cleanup
+            if cleanup then
+                local cleaned, released = pcall(cleanup)
+                if not cleaned or released == false then message = message .. "\nCleanup incomplete; rejoin before retrying." end
+            end
+            B.error = message
+            d.warn("[Auto GK] " .. message)
+            pcall(d.show, "Auto GK | Failed", message)
+        end
+        return ok, err
+    end
+    return B
+end
+
+local function createDmcStartupDisplay()
+    local gui, label, heading, closeConnection
+    local function hide()
+        if closeConnection then closeConnection:Disconnect(); closeConnection = nil end
+        if gui then gui:Destroy(); gui = nil end
+    end
+    local function show(title, message)
+        if not gui then
+            local player = game:GetService("Players").LocalPlayer
+            local parent = player and player:FindFirstChildOfClass("PlayerGui")
+            if not parent then return end
+            gui = Instance.new("ScreenGui")
+            gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "AutoGKStartup", false, 1000
+            local panel = Instance.new("Frame")
+            panel.AnchorPoint = Vector2.new(0.5, 0.5)
+            panel.Position, panel.Size = UDim2.new(0.5, 0, 0.4, 0), UDim2.new(0.9, 0, 0, 200)
+            panel.BackgroundColor3, panel.BorderSizePixel = Color3.fromRGB(16, 16, 15), 0
+            panel.Parent = gui
+            local size = Instance.new("UISizeConstraint")
+            size.MaxSize = Vector2.new(460, 200); size.Parent = panel
+            heading = Instance.new("TextLabel")
+            heading.Position, heading.Size = UDim2.new(0, 14, 0, 8), UDim2.new(1, -58, 0, 28)
+            heading.BackgroundTransparency, heading.TextSize = 1, 16
+            heading.TextXAlignment, heading.Font = Enum.TextXAlignment.Left, Enum.Font.GothamMedium
+            heading.TextColor3 = Color3.fromRGB(222, 193, 115); heading.Parent = panel
+            label = Instance.new("TextBox")
+            label.Position, label.Size = UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 1, -54)
+            label.BackgroundTransparency, label.TextSize, label.TextWrapped = 1, 13, true
+            label.ClearTextOnFocus, label.TextEditable, label.MultiLine = false, false, true
+            label.TextXAlignment, label.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
+            label.Font, label.TextColor3 = Enum.Font.Code, Color3.fromRGB(233, 231, 220)
+            label.Parent = panel
+            local close = Instance.new("TextButton")
+            close.Text, close.TextSize = "X", 14
+            close.Position, close.Size = UDim2.new(1, -38, 0, 8), UDim2.new(0, 28, 0, 28)
+            close.BackgroundColor3, close.TextColor3 = Color3.fromRGB(39, 37, 30), heading.TextColor3
+            close.Parent = panel
+            closeConnection = close.Activated:Connect(hide)
+            gui.Parent = parent
+        end
+        heading.Text, label.Text = title, message
+    end
+    return show, hide
+end
+
+local startupShow, startupHide = createDmcStartupDisplay()
+local BOOT = createDmcStartup({
+    now = os.clock, wait = function() task.wait(0.05) end, spawn = task.spawn,
+    require = require, warn = warn, show = startupShow, hide = startupHide,
+    ready = function()
+        local players = game:GetService("Players")
+        local deadline = os.clock() + 30
+        while (not game:IsLoaded() or not players.LocalPlayer) and os.clock() < deadline do
+            startupShow("Auto GK | Starting", "Waiting for the game...")
+            task.wait(0.1)
+        end
+        assert(game:IsLoaded() and players.LocalPlayer, "Game not ready")
+        assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui unavailable")
+        startupShow("Auto GK | Starting", "Loading modules...")
+    end,
+    resolve = function(path)
+        local object = game:GetService("ReplicatedStorage")
+        local deadline = os.clock() + 30
+        for name in string.gmatch(path, "[^.]+") do
+            object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
+            assert(object, "Missing: " .. path)
+        end
+        return object
+    end,
+})
+
+BOOT.Run(function()
+--==============================================================
+-- SERVICES
+--==============================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = assert(Players.LocalPlayer, "Run on client")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+local BUILD = "Auto GK Advanced 4.0 | +OffTarget +TrickShot +AutoTackle"
+local ENV = _G
+if type(getgenv) == "function" then
+    local ok, environment = pcall(getgenv)
+    if ok and type(environment) == "table" then ENV = environment end
+end
+
+--==============================================================
+-- MODULES
+--==============================================================
+
+local function resolve(path)
+    local object = ReplicatedStorage
+    for name in string.gmatch(path, "[^.]+") do
+        object = object:WaitForChild(name, 5)
+        assert(object, "Missing: " .. path)
+    end
+    return object
+end
+
+local function module(path)
+    return BOOT.Load(path)
+end
+
+local M = {
+    Dive = module("Modules.Actions.GoalkeeperDive"),
+    Assist = module("Modules.Actions.GoalkeeperDiveAssist"),
+    Actions = module("Modules.Actions.ActionCommands"),
+    Protocol = module("Modules.Actions.ActionRemoteProtocol"),
+    Locks = module("Modules.Actions.ActionLocks"),
+    Contacts = module("Modules.Actions.GoalkeeperActions"),
+    Physics = module("Modules.Ball.Physics"),
+    Hitboxes = module("Modules.Gameplay.HitboxSettings"),
+    Prediction = module("Modules.Gameplay.GoalkeeperPrediction"),
+    Match = module("Modules.Gameplay.MatchSettings"),
+    Controllers = module("Modules.Characters.CharacterControllers"),
+    Grounding = module("Modules.Characters.Grounding"),
+    Ragdoll = module("Modules.Characters.Ragdoll"),
+    Renderer = module("Client.Gameplay.Ball.Renderer"),
+    Teams = module("Client.Gameplay.ActorTeams"),
+    Practice = module("Client.Gameplay.PracticeSession"),
+    Movement = module("Client.Gameplay.Player.Movement"),
+    Presentation = module("Client.Gameplay.Actions.GoalkeeperDivePresentation"),
+    Slide = module("Client.Gameplay.Actions.SlideTackleInput"),
+    Dodge = module("Client.Gameplay.Actions.Dodge"),
+    Freeze = module("Client.Gameplay.KickoffFreeze"),
+    Replay = module("Client.Gameplay.Replay.GoalReplay"),
+    Clock = module("Client.Player.CharacterMotionSmoothing"),
+    Keybinds = module("Modules.Gameplay.Keybinds"),
+    Role = module("Client.Gameplay.Player.GoalkeeperRole"),
+    Actors = module("Modules.Characters.Actors"),
+    Motion = module("Modules.Characters.CharacterMotion"),
+}
+
+local BallRemotes = resolve("Remotes.Ball")
+local TackleRemote = BallRemotes:WaitForChild("Tackle", 5)
+local StateRemote = BallRemotes:WaitForChild("State", 5)
+
+assert(TackleRemote and StateRemote and PlayerGui, "Client not ready")
+
+--==============================================================
+-- CONFIGURATION
+--==============================================================
+
+local Config = {
+    Enabled = true,
+    PositionAssist = true,
+    PreShotCoverage = true,
+    CoverageRange = 65,
+    CoverageMinimumDepth = 3,
+    CoverageLeadSeconds = 0.10,
+    CoverageMaximumLead = 2,
+    CoverageStartRadius = 0.90,
+    CoverageStopRadius = 0.45,
+    CoverageUpdateHz = 20,
+    UrgentShotSeconds = 0.55,
+    PositionMode = "THREATS",
+    RespectManualMovement = true,
+    HighBallJumps = true,
+    JumpThenDive = true,
+    DiveFilter = "SMART",
+    BackwardRecovery = true,
+    PlannerHz = 12,
+    CloseShotPlannerHz = 30,
+    UISampleHz = 4,
+    SampleStep = 0.01,
+    PredictionHorizon = 1.10,
+    GoalMarginSeconds = 0.045,
+    JumpQueueEstimate = 0.05,
+    JumpQueueTimeout = 0.45,
+    JumpDiveMinimumAge = 0.07,
+    JumpRetrySeconds = 0.65,
+    HomeDepth = 8,
+    HomeRadius = 2.5,
+    PositionDeadzone = 0.65,
+    SafeLateralReach = 14,
+    PositionResponseSeconds = 0.14,
+    PositionStartDeadzone = 1.15,
+    HomeStopRadius = 1.25,
+    TargetChangeDeadzone = 0.20,
+    TargetResponseSeconds = 0.16,
+    ManualReleaseGrace = 0.18,
+    CachedFrameMaxAge = 0.12,
+    MissingStateDisplayDelay = 0.40,
+    UIStatusDebounce = 0.18,
+    UIEventHoldSeconds = 0.50,
+    MaxFinalCandidates = 14,
+    RuntimeErrorRetrySeconds = 0.25,
+    RuntimeErrorLimit = 3,
+    Debug = false,
+    -- NOVAS CONFIGURAÇÕES
+    ReactToOffTarget = true,
+    OffTargetMaxDistance = 25,
+    DetectTrickShots = true,
+    TrickShotVelocityThreshold = 50,
+    AutoTackle = true,
+    TackleRange = 20,
+    TackleCooldown = 2.0,
+}
+
+--==============================================================
+-- NOVAS FUNÇÕES - AUTO TACKLE / OFF TARGET / TRICK SHOT
+--==============================================================
+
+local NewState = {
+    lastTackleAt = 0,
+    lastDiveAt = 0,
+}
+
+local function getDirectionName(direction, camera)
+    local flatDir = Vector3.new(direction.X, 0, direction.Z).Unit
+    local camForward = Vector3.new(camera.CFrame.LookVector.X, 0, camera.CFrame.LookVector.Z).Unit
+    local camRight = Vector3.new(-camForward.Z, 0, camForward.X)
+    
+    local forwardDot = flatDir:Dot(camForward)
+    local rightDot = flatDir:Dot(camRight)
+    
+    if forwardDot > 0.7 then return "F"
+    elseif forwardDot < -0.7 then return "B"
+    elseif rightDot > 0.7 then return "R"
+    elseif rightDot < -0.7 then return "L"
+    elseif forwardDot > 0 and rightDot > 0 then return "RF"
+    elseif forwardDot > 0 and rightDot < 0 then return "LF"
+    elseif forwardDot < 0 and rightDot > 0 then return "RB"
+    elseif forwardDot < 0 and rightDot < 0 then return "LB"
+    end
+    return "F"
+end
+
+local function getDefendedGoal()
+    local goal = M.Practice.GetDefendedGoalPart()
+    if goal then return goal end
+    local team = M.Teams.GetActorTeamName(LocalPlayer)
+    if not team then return nil end
+    local map = workspace:FindFirstChild("Map")
+    local data = map and map:FindFirstChild("Data")
+    local home = data and data:FindFirstChild(team)
+    return home and home:FindFirstChild("Goal")
+end
+
+local function isBallHeadingToGoal(ballState, goal)
+    if not ballState or not goal then return false end
+    local ballPos = ballState.Position
+    local ballVel = ballState.Velocity
+    local goalPos = goal.Position
+    local toGoal = (goalPos - ballPos).Unit
+    local ballDir = ballVel.Unit
+    return toGoal:Dot(ballDir) > 0.7
+end
+
+local function getBallDistanceToGoal(ballState, goal)
+    if not ballState or not goal then return math.huge end
+    return (ballState.Position - goal.Position).Magnitude
+end
+
+local function canDive()
+    if not LocalPlayer.Character then return false end
+    local root = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    if os.clock() - NewState.lastDiveAt < 1.5 then return false end
+    if M.Dive.IsDiveConstraintActive(root) then return false end
+    if M.Locks.HasGoalkeeperDiveBlock(LocalPlayer, M.Renderer.GetVolleyLockUserId()) then return false end
+    return true
+end
+
+local function executeDive(direction)
+    if not canDive() then return false end
+    local character = LocalPlayer.Character
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    local camera = workspace.CurrentCamera
+    if not camera then return false end
+    local success = pcall(function()
+        M.Dive.Run(character, root, direction, camera.CFrame, {})
+    end)
+    if success then NewState.lastDiveAt = os.clock() end
+    return success
+end
+
+local function findNearestOpponent()
+    local character = LocalPlayer.Character
+    if not character then return nil end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local myTeam = LocalPlayer.Team
+    local nearest = nil
+    local nearestDist = Config.TackleRange
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Team ~= myTeam and player.Character then
+            local otherRoot = player.Character:FindFirstChild("HumanoidRootPart")
+            if otherRoot then
+                local dist = (otherRoot.Position - root.Position).Magnitude
+                if dist < nearestDist then nearestDist = dist; nearest = player end
+            end
+        end
+    end
+    return nearest, nearestDist
+end
+
+local function detectTrickShot(ballState)
+    if not Config.DetectTrickShots then return false end
+    if not ballState then return false end
+    local velocity = ballState.Velocity
+    local speed = velocity.Magnitude
+    if speed < Config.TrickShotVelocityThreshold then return false end
+    local goal = getDefendedGoal()
+    if not goal then return false end
+    local isHeadingToGoal = isBallHeadingToGoal(ballState, goal)
+    return not isHeadingToGoal
+end
+
+local function autoTackle()
+    if not Config.AutoTackle then return false end
+    if os.clock() - NewState.lastTackleAt < Config.TackleCooldown then return false end
+    local target, dist = findNearestOpponent()
+    if target and dist < Config.TackleRange then
+        local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+        if targetRoot then
+            local character = LocalPlayer.Character
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if root then
+                local direction = (targetRoot.Position - root.Position).Unit
+                local directionName = getDirectionName(direction, workspace.CurrentCamera)
+                if executeDive(directionName) then
+                    NewState.lastTackleAt = os.clock()
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function reactToOffTarget(ballState, goal)
+    if not Config.ReactToOffTarget then return false end
+    if not ballState or not goal then return false end
+    local isHeadingToGoal = isBallHeadingToGoal(ballState, goal)
+    local distanceToGoal = getBallDistanceToGoal(ballState, goal)
+    if not isHeadingToGoal and distanceToGoal < Config.OffTargetMaxDistance then
+        if Config.DetectTrickShots and detectTrickShot(ballState) then
+            if distanceToGoal < 15 then
+                local character = LocalPlayer.Character
+                local root = character:FindFirstChild("HumanoidRootPart")
+                if root then
+                    local direction = (ballState.Position - root.Position).Unit
+                    local directionName = getDirectionName(direction, workspace.CurrentCamera)
+                    return executeDive(directionName)
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- Loop das novas funções
+RunService.Heartbeat:Connect(function()
+    if not Config.Enabled then return end
+    if not LocalPlayer.Character then return end
+    if not M.Match.IsGoalkeeperCharacter(LocalPlayer.Character) then return end
+    
+    -- Auto Tackle
+    autoTackle()
+    
+    -- React to Off-Target
+    local ballState = M.Renderer.GetAuthoritativeMovementState()
+    if ballState then
+        local goal = getDefendedGoal()
+        if goal then
+            reactToOffTarget(ballState, goal)
+        end
+    end
+end)
+
+print("[Auto GK Advanced] Novas funções carregadas!")
+print("[Auto GK Advanced] Build: " .. BUILD)
+
+end)
